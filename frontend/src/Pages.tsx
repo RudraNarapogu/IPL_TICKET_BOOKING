@@ -149,7 +149,7 @@ export const SeatSelection = () => {
     if (!user) return navigate('/login');
     try {
       await Promise.all(selected.map(sid => api.post(`/matches/${id}/hold`, { seatId: sid })));
-      const confirm = window.confirm(\`Confirm booking for ₹\${seats.filter(s => selected.includes(s.id)).reduce((a,b)=>a+b.price, 0)}?\`);
+      const confirm = window.confirm(`Confirm booking for ₹${seats.filter(s => selected.includes(s.id)).reduce((a,b)=>a+b.price, 0)}?`);
       if (confirm) {
         await api.post('/bookings', { matchId: id, seatIds: selected });
         alert('Booking Successful!');
@@ -169,7 +169,7 @@ export const SeatSelection = () => {
         <div className="flex gap-2 mb-8 border-b pb-4 overflow-x-auto">
           {sections.map(sec => (
             <button key={sec} onClick={() => setActiveSection(sec)}
-              className={\`px-4 py-2 rounded-lg font-semibold whitespace-nowrap transition \${activeSection === sec ? 'bg-primary text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}\`}>
+              className={`px-4 py-2 rounded-lg font-semibold whitespace-nowrap transition ${activeSection === sec ? 'bg-primary text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
               {sec} Stand
             </button>
           ))}
@@ -181,11 +181,11 @@ export const SeatSelection = () => {
               <div className="flex gap-2">
                 {filteredSeats.filter(s => s.row === rowNum).sort((a,b) => a.col - b.col).map(s => (
                   <button key={s.id} onClick={() => toggle(s)}
-                    title={\`₹\${s.price}\`}
-                    className={\`w-10 h-10 rounded flex items-center justify-center text-xs font-bold transition
-                      \${s.status === 'SOLD' ? 'bg-gray-300 text-gray-500 cursor-not-allowed' :
+                    title={`₹${s.price}`}
+                    className={`w-10 h-10 rounded flex items-center justify-center text-xs font-bold transition
+                      ${s.status === 'SOLD' ? 'bg-gray-300 text-gray-500 cursor-not-allowed' :
                         s.status === 'HELD' ? 'bg-yellow-400 text-white cursor-not-allowed' :
-                        selected.includes(s.id) ? 'bg-primary text-white shadow-lg scale-110' : 'bg-green-100 text-green-800 hover:bg-green-200 border border-green-200'}\`}>
+                        selected.includes(s.id) ? 'bg-primary text-white shadow-lg scale-110' : 'bg-green-100 text-green-800 hover:bg-green-200 border border-green-200'}`}>
                     {s.col}
                   </button>
                 ))}
@@ -240,7 +240,7 @@ export const UserDashboard = () => {
                 <div>
                   <p className="font-bold text-xl text-secondary">{b.match.homeTeam} vs {b.match.awayTeam}</p>
                   <p className="text-sm text-gray-500">📅 {new Date(b.match.matchDate).toLocaleDateString()}</p>
-                  <p className="mt-2 text-sm">🎟️ <b>{b.seats.length} Seats:</b> {b.seats.map((s:any)=> \`R\${s.row}-C\${s.col}\`).join(', ')}</p>
+                  <p className="mt-2 text-sm">🎟️ <b>{b.seats.length} Seats:</b> {b.seats.map((s:any)=> `R${s.row}-C${s.col}`).join(', ')}</p>
                 </div>
                 <div className="text-right">
                   <p className="font-bold text-2xl text-primary mb-1">₹ {b.totalAmount}</p>
@@ -284,9 +284,9 @@ export const AdminDashboard = () => {
           { label: 'Total Users', val: stats.totalUsers, color: 'bg-blue-500' },
           { label: 'Total Bookings', val: stats.totalBookings, color: 'bg-green-500' },
           { label: 'Total Matches', val: stats.totalMatches, color: 'bg-purple-500' },
-          { label: 'Total Revenue', val: \`₹\${stats.totalRevenue}\`, color: 'bg-orange-500' }
+          { label: 'Total Revenue', val: `₹${stats.totalRevenue}`, color: 'bg-orange-500' }
         ].map(s => (
-          <div key={s.label} className={\`\${s.color} text-white p-6 rounded-2xl shadow-lg\`}>
+          <div key={s.label} className={`${s.color} text-white p-6 rounded-2xl shadow-lg`}>
             <p className="text-sm opacity-80 font-bold uppercase tracking-wider mb-1">{s.label}</p>
             <p className="text-3xl font-black">{s.val}</p>
           </div>
