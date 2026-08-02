@@ -33,7 +33,7 @@ const limiter = rateLimit({
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use('/api/', limiter);
+// app.use('/api/', limiter); // TEMPORARILY DISABLED FOR INCREMENTAL LOAD TESTING
 
 // --- MIDDLEWARE ---
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
