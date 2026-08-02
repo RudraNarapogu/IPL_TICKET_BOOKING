@@ -78,7 +78,7 @@ const limiter = rateLimit({
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use('/api/', limiter);
+// app.use('/api/', limiter); // DISABLED FOR ABSOLUTE BREAKING POINT TEST
 
 // --- RAW PERFORMANCE PING (No DB, No Redis, No Middleware) ---
 app.get('/ping', (req, res) => res.json({ status: 'ok' }));
