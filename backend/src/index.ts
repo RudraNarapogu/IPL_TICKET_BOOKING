@@ -78,7 +78,7 @@ const limiter = rateLimit({
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-// app.use('/api/', limiter); // TEMPORARILY DISABLED FOR FINAL STRENGTH TESTING
+app.use('/api/', limiter);
 
 // --- MIDDLEWARE ---
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
