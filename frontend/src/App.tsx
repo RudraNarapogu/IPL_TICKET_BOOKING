@@ -10,7 +10,8 @@ export interface Match { id: string; homeTeam: string; awayTeam: string; matchDa
 export interface Seat { id: string; row: number; col: number; section: string; price: number; status: 'AVAILABLE' | 'HELD' | 'SOLD'; }
 
 // --- API ---
-export const api = axios.create({ baseURL: '/api' });
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+export const api = axios.create({ baseURL: `${API_BASE_URL}/api` });
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) config.headers.Authorization = `Bearer ${token}`;
@@ -59,7 +60,7 @@ export const useAuth = () => {
 export const useSocket = (matchId?: string) => {
   const socketRef = useRef<Socket | null>(null);
   useEffect(() => {
-    socketRef.current = io('/');
+    socketRef.current = io(API_BASE_URL);
     if (matchId) socketRef.current.emit('join-match', matchId);
     return () => { socketRef.current?.disconnect(); };
   }, [matchId]);
