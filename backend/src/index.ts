@@ -142,10 +142,21 @@ app.get('/api/bookings', authenticate, async (req, res) => {
 
 // --- ADMIN ROUTES ---
 app.get('/api/admin/stats', authenticate, authorize(['ADMIN']), async (req, res) => {
-  const totalUsers = await prisma.user.count({ where: { role: 'USER' } });
-  const totalBookings = await prisma.booking.count({ where: { status: 'CONFIRMED' } });
-  const revenue = await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } });
-  res.json({ totalUsers, totalBookings, totalRevenue: revenue._sum.totalAmount || 0 });
+  try {
+    const totalUsers = await prisma.user.count();
+    const totalBookings = await prisma.booking.count({ where: { status: 'CONFIRMED' } });
+    const totalMatches = await prisma.match.count();
+    const revenue = await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } });
+
+    res.json({
+      totalUsers,
+      totalBookings,
+      totalMatches,
+      totalRevenue: revenue._sum.totalAmount || 0
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // --- SOCKETS ---
