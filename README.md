@@ -71,4 +71,4 @@ A full-stack application for booking IPL match tickets with real-time seat avail
 
 ## License
 
-MIT
+Rudra Narapogu
