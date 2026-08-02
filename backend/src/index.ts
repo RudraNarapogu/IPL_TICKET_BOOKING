@@ -33,7 +33,7 @@ const limiter = rateLimit({
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use('/api/', limiter);
+// app.use('/api/', limiter); // TEMPORARILY DISABLED FOR LOAD TESTING
 
 // --- MIDDLEWARE ---
 const authenticate = (req: Request, res: Response, next: NextFunction) => {
@@ -225,12 +225,6 @@ app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, r
       }
     }
     await prisma.matchSeat.createMany({ data: seatsData });
-
-    // Invalidate Cache so the new match shows up immediately
-    if (redis) {
-      await redis.del('matches:all');
-    }
-
     res.status(201).json({ message: 'Match created', match });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
