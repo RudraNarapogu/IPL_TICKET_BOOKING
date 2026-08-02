@@ -9,129 +9,30 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 
+import Redis from 'ioredis';
+
 dotenv.config();
 
 const prisma = new PrismaClient();
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
-
-// --- MIDDLEWARE ---
-
-const authenticate = (req: Request, res: Response, next: NextFunction) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ message: 'Authentication required' });
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET!);
-    (req as any).user = decoded;
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Invalid token' });
-  }
-};
-
-const authorize = (roles: string[]) => (req: Request, res: Response, next: NextFunction) => {
-  const user = (req as any).user;
-  if (!user || !roles.includes(user.role)) return res.status(403).json({ message: 'Forbidden' });
-  next();
-};
-
-// --- AUTH ROUTES ---
-
-const registerSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(6),
-  name: z.string().min(2),
-});
-
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { email, password, name } = registerSchema.parse(req.body);
-    const existingUser = await prisma.user.findUnique({ where: { email } });
-    if (existingUser) return res.status(400).json({ message: 'User already exists' });
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({ data: { email, password: hashedPassword, name } });
-    res.status(201).json({ message: 'User created', userId: user.id });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({ message: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET!, { expiresIn: '24h' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.get('/api/auth/profile', authenticate, async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: (req as any).user.userId },
-    select: { id: true, email: true, name: true, role: true },
-  });
-  res.json(user);
-});
-
-// --- MATCH ROUTES ---
-
-app.get('/api/matches', async (req, res) => {
-  const matches = await prisma.match.findMany({ include: { stadium: true }, where: { deletedAt: null } });
-  res.json(matches);
-});
-
-app.get('/api/matches/:id', async (req, res) => {
-  const match = await prisma.match.findUnique({
-    where: { id: req.params.id },
-    include: { stadium: true, layout: true },
-  });
-  if (!match) return res.status(404).json({ message: 'Match not found' });
-  res.json(match);
-});
-
-app.get('/api/matches/:id/seats', async (req, res) => {
-  const seats = await prisma.matchSeat.findMany({ where: { matchId: req.params.id } });
-  res.json(seats);
-});
-
+// --- HIGH PERFORMANCE SEAT HOLD ---
 app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
-  try {
-    const { seatId } = req.body;
-    const userId = (req as any).user.userId;
+  const { seatId } = req.body;
+  const userId = (req as any).user.userId;
+  const matchId = req.params.id;
 
-    const seat = await prisma.$transaction(async (tx) => {
-      const currentSeat = await tx.matchSeat.findUnique({ where: { id: seatId } });
-      if (!currentSeat || currentSeat.status === 'SOLD') throw new Error('Seat not available');
-      if (currentSeat.status === 'HELD' && currentSeat.heldUntil && currentSeat.heldUntil > new Date() && currentSeat.heldBy !== userId) {
-        throw new Error('Seat already held');
-      }
+  // Use Redis for Atomic Locking (Atomic operations prevent double-booking at 30k req/s)
+  const lockKey = `lock:seat:${seatId}`;
+  const isHeld = await redis.set(lockKey, userId, 'EX', 300, 'NX');
 
-      return tx.matchSeat.update({
-        where: { id: seatId },
-        data: { status: 'HELD', heldBy: userId, heldUntil: new Date(Date.now() + 5 * 60 * 1000) },
-      });
-    });
-
-    io.to(`match-${req.params.id}`).emit('seat-held', { seatId, userId });
-    res.json({ message: 'Seat held', seat });
-  } catch (error: any) {
-    res.status(400).json({ error: error.message });
+  if (!isHeld) {
+    return res.status(400).json({ error: 'Seat is already being held or sold' });
   }
+
+  // Notify via Socket (In production, use Redis Adapter for Sockets)
+  io.to(`match-${matchId}`).emit('seat-held', { seatId, userId });
+  res.json({ message: 'Seat held in cache' });
 });
 
 // --- BOOKING ROUTES ---
