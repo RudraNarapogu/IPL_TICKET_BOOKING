@@ -61,7 +61,12 @@ app.post('/api/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({ data: { email, password: hashedPassword, name } });
     res.status(201).json({ message: 'User created', userId: user.id });
-  } catch (error: any) { res.status(400).json({ error: error.message }); }
+  } catch (error: any) {
+    if (error.code === 'P2002') {
+      return res.status(400).json({ error: 'Email already exists' });
+    }
+    res.status(400).json({ error: error.message });
+  }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -94,8 +99,32 @@ app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
 
 // --- MATCH & BOOKING ROUTES ---
 app.get('/api/matches', async (req, res) => {
-  const matches = await prisma.match.findMany({ include: { stadium: true }, where: { deletedAt: null } });
-  res.json(matches);
+  try {
+    const cacheKey = 'matches:all';
+
+    // 1. Try to get from Redis Cache first
+    if (redis) {
+      const cachedMatches = await redis.get(cacheKey);
+      if (cachedMatches) {
+        return res.json(JSON.parse(cachedMatches));
+      }
+    }
+
+    // 2. If not in cache, get from DB
+    const matches = await prisma.match.findMany({
+      include: { stadium: true },
+      where: { deletedAt: null }
+    });
+
+    // 3. Store in Redis for next time (expires in 10 minutes)
+    if (redis) {
+      await redis.set(cacheKey, JSON.stringify(matches), 'EX', 600);
+    }
+
+    res.json(matches);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/api/matches/:id', async (req, res) => {
@@ -196,6 +225,12 @@ app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, r
       }
     }
     await prisma.matchSeat.createMany({ data: seatsData });
+
+    // Invalidate Cache so the new match shows up immediately
+    if (redis) {
+      await redis.del('matches:all');
+    }
+
     res.status(201).json({ message: 'Match created', match });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
