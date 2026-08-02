@@ -10,6 +10,7 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import Redis from 'ioredis';
 import { rateLimit } from 'express-rate-limit';
+import { slowDown } from 'express-slow-down';
 import { Queue, Worker, Job } from 'bullmq';
 
 dotenv.config();
@@ -37,50 +38,56 @@ const bookingQueue = connection ? new Queue('bookings', { connection }) : null;
 if (connection) {
   new Worker('bookings', async (job: Job) => {
     const { matchId, seatIds, userId, totalAmount } = job.data;
-
     try {
       return await prisma.$transaction(async (tx) => {
-        // Double check seats again inside worker
         const seats = await tx.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
         for (const seat of seats) {
           if (seat.status === 'SOLD') throw new Error(`Seat ${seat.row}-${seat.col} already sold`);
         }
-
         const newBooking = await tx.booking.create({
           data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } },
         });
-
         await tx.matchSeat.updateMany({
           where: { id: { in: seatIds } },
           data: { status: 'SOLD', bookingId: newBooking.id }
         });
-
-        // Notify client via WebSocket (we use io in the main scope)
         seatIds.forEach((seatId: string) => io.to(`match-${matchId}`).emit('seat-booked', { seatId }));
-
         return newBooking;
       });
     } catch (error: any) {
       console.error(`Booking Job ${job.id} failed:`, error.message);
       throw error;
     }
-  }, { connection, concurrency: 5 }); // Process 5 bookings at a time per core
+  }, { connection, concurrency: 5 });
 }
 
-// --- RATE LIMITING ---
-const limiter = rateLimit({
+// --- INTELLIGENT TRAFFIC CONTROL ---
+
+// 1. Slow Down (The "Loading" Effect): After 50 requests, start adding 500ms delay per request
+const speedLimiter = slowDown({
   windowMs: 15 * 60 * 1000,
-  limit: 200, // Increased for load testing
+  delayAfter: 50, // Allow 50 fast requests
+  delayMs: (hits) => hits * 500, // Add 500ms delay per additional hit
+  maxDelayMs: 10000, // Maximum delay of 10 seconds
+});
+
+// 2. Rate Limit (The "Crash Protection"): Hard block after 200 requests
+const hardLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 200,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  message: { error: 'Server busy. Please try again in a few minutes.' }
 });
 
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use('/api/', limiter);
 
-// --- RAW PERFORMANCE PING (No DB, No Redis, No Middleware) ---
+// Apply traffic control to all API routes
+app.use('/api/', speedLimiter, hardLimiter);
+
+// --- RAW PERFORMANCE PING ---
 app.get('/ping', (req, res) => res.json({ status: 'ok' }));
 
 // --- MIDDLEWARE ---
@@ -130,14 +137,11 @@ app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
   const { seatId } = req.body;
   const userId = (req as any).user.userId;
   const matchId = req.params.id;
-
   if (!redis) return res.json({ message: 'Seat held (No Redis)' });
-
-  const lockKey = `lock:seat:${seatId}`;
+  const lockKey = \`lock:seat:\${seatId}\`;
   const isHeld = await redis.set(lockKey, userId, 'EX', 300, 'NX');
   if (!isHeld) return res.status(400).json({ error: 'Seat is already being held or sold' });
-
-  io.to(`match-${matchId}`).emit('seat-held', { seatId, userId });
+  io.to(\`match-\${matchId}\`).emit('seat-held', { seatId, userId });
   res.json({ message: 'Seat held in cache' });
 });
 
@@ -146,8 +150,8 @@ app.get('/api/matches', async (req, res) => {
   try {
     const cacheKey = 'matches:all';
     if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) return res.json(JSON.parse(cached));
+      const cachedMatches = await redis.get(cacheKey);
+      if (cachedMatches) return res.json(JSON.parse(cachedMatches));
     }
     const matches = await prisma.match.findMany({ include: { stadium: true }, where: { deletedAt: null } });
     if (redis) await redis.set(cacheKey, JSON.stringify(matches), 'EX', 600);
@@ -157,12 +161,13 @@ app.get('/api/matches', async (req, res) => {
 
 app.get('/api/matches/:id', async (req, res) => {
   try {
-    const cacheKey = `match:${req.params.id}`;
+    const matchId = req.params.id;
+    const cacheKey = \`match:\${matchId}\`;
     if (redis) {
       const cached = await redis.get(cacheKey);
       if (cached) return res.json(JSON.parse(cached));
     }
-    const match = await prisma.match.findUnique({ where: { id: req.params.id }, include: { stadium: true, layout: true } });
+    const match = await prisma.match.findUnique({ where: { id: matchId }, include: { stadium: true, layout: true } });
     if (!match) return res.status(404).json({ message: 'Match not found' });
     if (redis) await redis.set(cacheKey, JSON.stringify(match), 'EX', 600);
     res.json(match);
@@ -178,28 +183,32 @@ app.post('/api/bookings', authenticate, async (req, res) => {
   try {
     const { matchId, seatIds } = req.body;
     const userId = (req as any).user.userId;
-
     if (redis) {
       for (const seatId of seatIds) {
-        if (await redis.get(`lock:seat:${seatId}`) !== userId) {
-          return res.status(403).json({ error: `Lock expired for seat ${seatId}` });
-        }
+        const lockKey = \`lock:seat:\${seatId}\`;
+        const lockOwner = await redis.get(lockKey);
+        if (lockOwner !== userId) return res.status(403).json({ error: \`Lock expired for seat \${seatId}\` });
       }
     }
-
     const seats = await prisma.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
     const totalAmount = seats.reduce((acc, s) => acc + s.price, 0);
-
     if (bookingQueue) {
       const job = await bookingQueue.add('process-booking', { matchId, seatIds, userId, totalAmount });
       return res.status(202).json({ message: 'Booking is being processed', jobId: job.id });
     }
-
-    // Fallback if no Redis/Queue
     const booking = await prisma.$transaction(async (tx) => {
-      await tx.matchSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: 'SOLD' } });
-      return await tx.booking.create({ data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } } });
+      const seatsInDb = await tx.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
+      for (const seat of seatsInDb) if (seat.status === 'SOLD') throw new Error('Seat sold');
+      const newBooking = await tx.booking.create({ data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } } });
+      await tx.matchSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: 'SOLD', bookingId: newBooking.id } });
+      return newBooking;
     });
+    if (redis) {
+      const pipeline = redis.pipeline();
+      seatIds.forEach((id: string) => pipeline.del(\`lock:seat:\${id}\`));
+      await pipeline.exec();
+    }
+    seatIds.forEach((seatId: string) => io.to(\`match-\${matchId}\`).emit('seat-booked', { seatId }));
     res.status(201).json(booking);
   } catch (error: any) { res.status(400).json({ error: error.message }); }
 });
@@ -215,13 +224,11 @@ app.get('/api/bookings', authenticate, async (req, res) => {
 // --- ADMIN ROUTES ---
 app.get('/api/admin/stats', authenticate, authorize(['ADMIN']), async (req, res) => {
   try {
-    const stats = {
-      totalUsers: await prisma.user.count(),
-      totalBookings: await prisma.booking.count({ where: { status: 'CONFIRMED' } }),
-      totalMatches: await prisma.match.count(),
-      revenue: (await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } }))._sum.totalAmount || 0
-    };
-    res.json(stats);
+    const totalUsers = await prisma.user.count();
+    const totalBookings = await prisma.booking.count({ where: { status: 'CONFIRMED' } });
+    const totalMatches = await prisma.match.count();
+    const revenue = await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } });
+    res.json({ totalUsers, totalBookings, totalMatches, totalRevenue: revenue._sum.totalAmount || 0 });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -231,7 +238,6 @@ app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, r
     const stadium = await prisma.stadium.findFirst();
     const layout = await prisma.seatLayout.findFirst();
     if (!stadium || !layout) throw new Error('Seed DB first');
-
     const match = await prisma.match.create({ data: { homeTeam, awayTeam, matchDate: new Date(matchDate), basePrice: Number(basePrice), stadiumId: stadium.id, layoutId: layout.id } });
     const stands = ['North', 'East', 'South', 'West'];
     const seatsData = [];
@@ -250,8 +256,8 @@ app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, r
 
 // --- SOCKETS ---
 io.on('connection', (socket) => {
-  socket.on('join-match', (matchId) => socket.join(`match-${matchId}`));
+  socket.on('join-match', (matchId) => socket.join(\`match-\${matchId}\`));
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(\`Server running on port \${PORT}\`));
