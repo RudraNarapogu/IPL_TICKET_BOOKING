@@ -18,6 +18,8 @@ model User {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
+
+  @@index([email])
 }
 
 model Stadium {
@@ -60,6 +62,9 @@ model Match {
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   deletedAt    DateTime?
+
+  @@index([matchDate])
+  @@index([deletedAt])
 }
 
 model MatchSeat {
@@ -79,6 +84,8 @@ model MatchSeat {
   updatedAt DateTime   @updatedAt
 
   @@unique([matchId, row, col, section])
+  @@index([matchId, status])
+  @@index([heldBy])
 }
 
 model Booking {
@@ -93,6 +100,9 @@ model Booking {
   payment     Payment?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
+
+  @@index([userId])
+  @@index([matchId])
 }
 
 model Payment {

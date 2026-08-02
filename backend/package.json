@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "dist/index.js",
   "scripts": {
-    "start": "node dist/index.js",
+    "start": "pm2-runtime start dist/index.js -i max",
     "dev": "ts-node-dev --respawn src/index.ts",
     "build": "npx prisma generate && npx tsc",
     "prisma:generate": "prisma generate",
@@ -13,6 +13,7 @@
   "dependencies": {
     "@prisma/client": "^5.x",
     "bcrypt": "^5.1.1",
+    "bullmq": "^5.41.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
@@ -20,6 +21,7 @@
     "helmet": "^7.1.0",
     "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.2",
+    "pm2": "^5.4.1",
     "socket.io": "^4.7.5",
     "zod": "^3.23.8"
   },

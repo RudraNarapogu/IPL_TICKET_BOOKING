@@ -10,11 +10,20 @@ import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import Redis from 'ioredis';
 import { rateLimit } from 'express-rate-limit';
+import { Queue, Worker, Job } from 'bullmq';
 
 dotenv.config();
 
 const prisma = new PrismaClient();
+const redisConfig = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+  password: process.env.REDIS_PASSWORD,
+  url: process.env.REDIS_URL
+};
+
 const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
+const connection = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null }) : null;
 
 const app = express();
 const server = http.createServer(app);
@@ -22,10 +31,46 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
+// --- QUEUE SYSTEM (For handling massive booking spikes) ---
+const bookingQueue = connection ? new Queue('bookings', { connection }) : null;
+
+if (connection) {
+  new Worker('bookings', async (job: Job) => {
+    const { matchId, seatIds, userId, totalAmount } = job.data;
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+        // Double check seats again inside worker
+        const seats = await tx.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
+        for (const seat of seats) {
+          if (seat.status === 'SOLD') throw new Error(`Seat ${seat.row}-${seat.col} already sold`);
+        }
+
+        const newBooking = await tx.booking.create({
+          data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } },
+        });
+
+        await tx.matchSeat.updateMany({
+          where: { id: { in: seatIds } },
+          data: { status: 'SOLD', bookingId: newBooking.id }
+        });
+
+        // Notify client via WebSocket (we use io in the main scope)
+        seatIds.forEach((seatId: string) => io.to(`match-${matchId}`).emit('seat-booked', { seatId }));
+
+        return newBooking;
+      });
+    } catch (error: any) {
+      console.error(`Booking Job ${job.id} failed:`, error.message);
+      throw error;
+    }
+  }, { connection, concurrency: 5 }); // Process 5 bookings at a time per core
+}
+
 // --- RATE LIMITING ---
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 100,
+  limit: 200, // Increased for load testing
   standardHeaders: 'draft-7',
   legacyHeaders: false,
 });
@@ -62,9 +107,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = await prisma.user.create({ data: { email, password: hashedPassword, name } });
     res.status(201).json({ message: 'User created', userId: user.id });
   } catch (error: any) {
-    if (error.code === 'P2002') {
-      return res.status(400).json({ error: 'Email already exists' });
-    }
+    if (error.code === 'P2002') return res.status(400).json({ error: 'Email already exists' });
     res.status(400).json({ error: error.message });
   }
 });
@@ -85,9 +128,7 @@ app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
   const userId = (req as any).user.userId;
   const matchId = req.params.id;
 
-  if (!redis) {
-    return res.json({ message: 'Seat held (No Redis)' });
-  }
+  if (!redis) return res.json({ message: 'Seat held (No Redis)' });
 
   const lockKey = `lock:seat:${seatId}`;
   const isHeld = await redis.set(lockKey, userId, 'EX', 300, 'NX');
@@ -101,51 +142,26 @@ app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
 app.get('/api/matches', async (req, res) => {
   try {
     const cacheKey = 'matches:all';
-
-    // 1. Try to get from Redis Cache first
-    if (redis) {
-      const cachedMatches = await redis.get(cacheKey);
-      if (cachedMatches) {
-        return res.json(JSON.parse(cachedMatches));
-      }
-    }
-
-    // 2. If not in cache, get from DB
-    const matches = await prisma.match.findMany({
-      include: { stadium: true },
-      where: { deletedAt: null }
-    });
-
-    // 3. Store in Redis for next time (expires in 10 minutes)
-    if (redis) {
-      await redis.set(cacheKey, JSON.stringify(matches), 'EX', 600);
-    }
-
-    res.json(matches);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/matches/:id', async (req, res) => {
-  try {
-    const matchId = req.params.id;
-    const cacheKey = `match:${matchId}`;
-
     if (redis) {
       const cached = await redis.get(cacheKey);
       if (cached) return res.json(JSON.parse(cached));
     }
+    const matches = await prisma.match.findMany({ include: { stadium: true }, where: { deletedAt: null } });
+    if (redis) await redis.set(cacheKey, JSON.stringify(matches), 'EX', 600);
+    res.json(matches);
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
 
-    const match = await prisma.match.findUnique({
-      where: { id: matchId },
-      include: { stadium: true, layout: true }
-    });
-
+app.get('/api/matches/:id', async (req, res) => {
+  try {
+    const cacheKey = `match:${req.params.id}`;
+    if (redis) {
+      const cached = await redis.get(cacheKey);
+      if (cached) return res.json(JSON.parse(cached));
+    }
+    const match = await prisma.match.findUnique({ where: { id: req.params.id }, include: { stadium: true, layout: true } });
     if (!match) return res.status(404).json({ message: 'Match not found' });
-
     if (redis) await redis.set(cacheKey, JSON.stringify(match), 'EX', 600);
-
     res.json(match);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
@@ -160,39 +176,27 @@ app.post('/api/bookings', authenticate, async (req, res) => {
     const { matchId, seatIds } = req.body;
     const userId = (req as any).user.userId;
 
-    // --- ENTERPRISE FIX: VERIFY REDIS LOCK OWNERSHIP ---
     if (redis) {
       for (const seatId of seatIds) {
-        const lockKey = `lock:seat:${seatId}`;
-        const lockOwner = await redis.get(lockKey);
-        // If someone else holds the lock or lock expired, block the booking
-        if (lockOwner !== userId) {
-          return res.status(403).json({ error: `You do not hold the lock for seat ${seatId}. It may have expired.` });
+        if (await redis.get(`lock:seat:${seatId}`) !== userId) {
+          return res.status(403).json({ error: `Lock expired for seat ${seatId}` });
         }
       }
     }
 
-    const booking = await prisma.$transaction(async (tx) => {
-      const seats = await tx.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
-      for (const seat of seats) {
-        if (seat.status === 'SOLD') throw new Error('Seat sold');
-      }
-      const totalAmount = seats.reduce((acc, s) => acc + s.price, 0);
-      const newBooking = await tx.booking.create({
-        data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } },
-      });
-      await tx.matchSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: 'SOLD', bookingId: newBooking.id } });
-      return newBooking;
-    });
+    const seats = await prisma.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
+    const totalAmount = seats.reduce((acc, s) => acc + s.price, 0);
 
-    // --- CLEANUP: DELETE REDIS LOCKS AFTER SUCCESS ---
-    if (redis) {
-      const pipeline = redis.pipeline();
-      seatIds.forEach((id: string) => pipeline.del(`lock:seat:${id}`));
-      await pipeline.exec();
+    if (bookingQueue) {
+      const job = await bookingQueue.add('process-booking', { matchId, seatIds, userId, totalAmount });
+      return res.status(202).json({ message: 'Booking is being processed', jobId: job.id });
     }
 
-    seatIds.forEach((seatId: string) => io.to(`match-${matchId}`).emit('seat-booked', { seatId }));
+    // Fallback if no Redis/Queue
+    const booking = await prisma.$transaction(async (tx) => {
+      await tx.matchSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: 'SOLD' } });
+      return await tx.booking.create({ data: { userId, matchId, totalAmount, status: 'CONFIRMED', seats: { connect: seatIds.map((id: string) => ({ id })) } } });
+    });
     res.status(201).json(booking);
   } catch (error: any) { res.status(400).json({ error: error.message }); }
 });
@@ -208,20 +212,14 @@ app.get('/api/bookings', authenticate, async (req, res) => {
 // --- ADMIN ROUTES ---
 app.get('/api/admin/stats', authenticate, authorize(['ADMIN']), async (req, res) => {
   try {
-    const totalUsers = await prisma.user.count();
-    const totalBookings = await prisma.booking.count({ where: { status: 'CONFIRMED' } });
-    const totalMatches = await prisma.match.count();
-    const revenue = await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } });
-
-    res.json({
-      totalUsers,
-      totalBookings,
-      totalMatches,
-      totalRevenue: revenue._sum.totalAmount || 0
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+    const stats = {
+      totalUsers: await prisma.user.count(),
+      totalBookings: await prisma.booking.count({ where: { status: 'CONFIRMED' } }),
+      totalMatches: await prisma.match.count(),
+      revenue: (await prisma.booking.aggregate({ _sum: { totalAmount: true }, where: { status: 'CONFIRMED' } }))._sum.totalAmount || 0
+    };
+    res.json(stats);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, res) => {
@@ -229,42 +227,22 @@ app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, r
     const { homeTeam, awayTeam, matchDate, basePrice } = req.body;
     const stadium = await prisma.stadium.findFirst();
     const layout = await prisma.seatLayout.findFirst();
+    if (!stadium || !layout) throw new Error('Seed DB first');
 
-    if (!stadium || !layout) throw new Error('No stadium or layout found. Seed the DB first.');
-
-    const match = await prisma.match.create({
-      data: {
-        homeTeam,
-        awayTeam,
-        matchDate: new Date(matchDate),
-        basePrice: Number(basePrice),
-        stadiumId: stadium.id,
-        layoutId: layout.id,
-      }
-    });
-
-    // Generate seats (Minimal for performance)
+    const match = await prisma.match.create({ data: { homeTeam, awayTeam, matchDate: new Date(matchDate), basePrice: Number(basePrice), stadiumId: stadium.id, layoutId: layout.id } });
     const stands = ['North', 'East', 'South', 'West'];
     const seatsData = [];
     for (const stand of stands) {
       for (let r = 1; r <= 10; r++) {
         for (let c = 1; c <= 10; c++) {
-          seatsData.push({
-            matchId: match.id,
-            row: r,
-            col: c,
-            section: stand,
-            price: match.basePrice + (r * 10),
-            status: 'AVAILABLE',
-          });
+          seatsData.push({ matchId: match.id, row: r, col: c, section: stand, price: match.basePrice + (r * 10), status: 'AVAILABLE' });
         }
       }
     }
     await prisma.matchSeat.createMany({ data: seatsData });
+    if (redis) await redis.del('matches:all');
     res.status(201).json({ message: 'Match created', match });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 // --- SOCKETS ---

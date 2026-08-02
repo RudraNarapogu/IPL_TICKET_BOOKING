@@ -27,5 +27,8 @@ COPY --from=backend-builder /app/backend/package.json ./backend/package.json
 COPY --from=backend-builder /app/backend/prisma ./backend/prisma
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
+# Install pm2 globally in the runner image
+RUN npm install -g pm2
+
 EXPOSE 3001
-CMD ["node", "backend/dist/index.js"]
+CMD ["pm2-runtime", "start", "backend/dist/index.js", "-i", "max"]
