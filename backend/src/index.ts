@@ -159,6 +159,49 @@ app.get('/api/admin/stats', authenticate, authorize(['ADMIN']), async (req, res)
   }
 });
 
+app.post('/api/admin/matches', authenticate, authorize(['ADMIN']), async (req, res) => {
+  try {
+    const { homeTeam, awayTeam, matchDate, basePrice } = req.body;
+    const stadium = await prisma.stadium.findFirst();
+    const layout = await prisma.seatLayout.findFirst();
+
+    if (!stadium || !layout) throw new Error('No stadium or layout found. Seed the DB first.');
+
+    const match = await prisma.match.create({
+      data: {
+        homeTeam,
+        awayTeam,
+        matchDate: new Date(matchDate),
+        basePrice: Number(basePrice),
+        stadiumId: stadium.id,
+        layoutId: layout.id,
+      }
+    });
+
+    // Generate seats (Minimal for performance)
+    const stands = ['North', 'East', 'South', 'West'];
+    const seatsData = [];
+    for (const stand of stands) {
+      for (let r = 1; r <= 10; r++) {
+        for (let c = 1; c <= 10; c++) {
+          seatsData.push({
+            matchId: match.id,
+            row: r,
+            col: c,
+            section: stand,
+            price: match.basePrice + (r * 10),
+            status: 'AVAILABLE',
+          });
+        }
+      }
+    }
+    await prisma.matchSeat.createMany({ data: seatsData });
+    res.status(201).json({ message: 'Match created', match });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- SOCKETS ---
 io.on('connection', (socket) => {
   socket.on('join-match', (matchId) => socket.join(`match-${matchId}`));
