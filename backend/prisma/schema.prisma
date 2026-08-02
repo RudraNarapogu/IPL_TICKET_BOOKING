@@ -1,0 +1,107 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+
+model User {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  password  String
+  name      String
+  role      String    @default("USER")
+  bookings  Booking[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+}
+
+model Stadium {
+  id          String       @id @default(uuid())
+  name        String
+  location    String
+  city        String
+  layouts     SeatLayout[]
+  matches     Match[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+}
+
+model SeatLayout {
+  id        String   @id @default(uuid())
+  stadiumId String
+  stadium   Stadium  @relation(fields: [stadiumId], references: [id])
+  name      String
+  rows      Int
+  cols      Int
+  config    String   // Detailed seat mapping/sections (JSON stringified)
+  matches   Match[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Match {
+  id           String      @id @default(uuid())
+  stadiumId    String
+  stadium      Stadium     @relation(fields: [stadiumId], references: [id])
+  layoutId     String
+  layout       SeatLayout  @relation(fields: [layoutId], references: [id])
+  homeTeam     String
+  awayTeam     String
+  matchDate    DateTime
+  basePrice    Float
+  matchSeats   MatchSeat[]
+  bookings     Booking[]
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  deletedAt    DateTime?
+}
+
+model MatchSeat {
+  id        String     @id @default(uuid())
+  matchId   String
+  match     Match      @relation(fields: [matchId], references: [id])
+  row       Int
+  col       Int
+  section   String
+  price     Float
+  status    String     @default("AVAILABLE")
+  heldUntil DateTime?
+  heldBy    String?    // User ID or Session ID
+  bookingId String?
+  booking   Booking?   @relation(fields: [bookingId], references: [id])
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([matchId, row, col, section])
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  userId      String
+  user        User          @relation(fields: [userId], references: [id])
+  matchId     String
+  match       Match         @relation(fields: [matchId], references: [id])
+  status      String        @default("PENDING")
+  totalAmount Float
+  seats       MatchSeat[]
+  payment     Payment?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+}
+
+model Payment {
+  id            String   @id @default(uuid())
+  bookingId     String   @unique
+  booking       Booking  @relation(fields: [bookingId], references: [id])
+  transactionId String?
+  amount        Float
+  method        String
+  status        String
+  createdAt     DateTime @default(now())
+}
