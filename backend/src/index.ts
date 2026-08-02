@@ -128,9 +128,26 @@ app.get('/api/matches', async (req, res) => {
 });
 
 app.get('/api/matches/:id', async (req, res) => {
-  const match = await prisma.match.findUnique({ where: { id: req.params.id }, include: { stadium: true, layout: true } });
-  if (!match) return res.status(404).json({ message: 'Match not found' });
-  res.json(match);
+  try {
+    const matchId = req.params.id;
+    const cacheKey = `match:${matchId}`;
+
+    if (redis) {
+      const cached = await redis.get(cacheKey);
+      if (cached) return res.json(JSON.parse(cached));
+    }
+
+    const match = await prisma.match.findUnique({
+      where: { id: matchId },
+      include: { stadium: true, layout: true }
+    });
+
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    if (redis) await redis.set(cacheKey, JSON.stringify(match), 'EX', 600);
+
+    res.json(match);
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/matches/:id/seats', async (req, res) => {
@@ -142,6 +159,18 @@ app.post('/api/bookings', authenticate, async (req, res) => {
   try {
     const { matchId, seatIds } = req.body;
     const userId = (req as any).user.userId;
+
+    // --- ENTERPRISE FIX: VERIFY REDIS LOCK OWNERSHIP ---
+    if (redis) {
+      for (const seatId of seatIds) {
+        const lockKey = `lock:seat:${seatId}`;
+        const lockOwner = await redis.get(lockKey);
+        // If someone else holds the lock or lock expired, block the booking
+        if (lockOwner !== userId) {
+          return res.status(403).json({ error: `You do not hold the lock for seat ${seatId}. It may have expired.` });
+        }
+      }
+    }
 
     const booking = await prisma.$transaction(async (tx) => {
       const seats = await tx.matchSeat.findMany({ where: { id: { in: seatIds }, matchId } });
@@ -155,6 +184,13 @@ app.post('/api/bookings', authenticate, async (req, res) => {
       await tx.matchSeat.updateMany({ where: { id: { in: seatIds } }, data: { status: 'SOLD', bookingId: newBooking.id } });
       return newBooking;
     });
+
+    // --- CLEANUP: DELETE REDIS LOCKS AFTER SUCCESS ---
+    if (redis) {
+      const pipeline = redis.pipeline();
+      seatIds.forEach((id: string) => pipeline.del(`lock:seat:${id}`));
+      await pipeline.exec();
+    }
 
     seatIds.forEach((seatId: string) => io.to(`match-${matchId}`).emit('seat-booked', { seatId }));
     res.status(201).json(booking);
