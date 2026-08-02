@@ -1,0 +1,1 @@
+npm install --legacy-peer-deps && npx prisma generate && npx prisma migrate deploy && npx ts-node prisma/seed.ts && npx tsc

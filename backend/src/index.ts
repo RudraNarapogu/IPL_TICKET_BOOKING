@@ -14,7 +14,7 @@ import { rateLimit } from 'express-rate-limit';
 dotenv.config();
 
 const prisma = new PrismaClient();
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
 
 const app = express();
 const server = http.createServer(app);
@@ -80,9 +80,12 @@ app.post('/api/matches/:id/hold', authenticate, async (req, res) => {
   const userId = (req as any).user.userId;
   const matchId = req.params.id;
 
+  if (!redis) {
+    return res.json({ message: 'Seat held (No Redis)' });
+  }
+
   const lockKey = `lock:seat:${seatId}`;
   const isHeld = await redis.set(lockKey, userId, 'EX', 300, 'NX');
-
   if (!isHeld) return res.status(400).json({ error: 'Seat is already being held or sold' });
 
   io.to(`match-${matchId}`).emit('seat-held', { seatId, userId });
